@@ -97,6 +97,9 @@ class FusionJob:
     output_rows: int = 0
     skipped_rows: int = 0
     merged_records: list[dict[str, Any]] = field(default_factory=list)
+    run_status: str = "待执行"
+    run_started_at: str = ""
+    run_completed_at: str = ""
 
     def to_record(self) -> dict[str, Any]:
         return {

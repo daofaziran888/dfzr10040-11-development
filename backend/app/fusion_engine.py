@@ -29,6 +29,14 @@ from app.models import (
     WatermarkRecord,
     WideTableDef,
 )
+from app.ingest import (
+    FusionRunState,
+    ParsedFile,
+    SourceBatch,
+    SourceBatchReceipt,
+    parse_csv_content,
+    sha256_digest,
+)
 
 
 def _now_iso() -> str:
@@ -60,6 +68,10 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        self._batches: dict[int, SourceBatch] = {}
+        self._batch_seq: dict[str, int] = {}
+        self._runs: dict[int, FusionRunState] = {}
+        self._run_records: dict[int, dict[str, dict[str, Any]]] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -370,11 +382,461 @@ class FusionEngine:
         self._monitors[sid] = metric
         return metric
 
+    # ---- 来源批次文件接入 ----
+
+    def import_source_batch(self, source_code: str, batch_name: str, file_name: str,
+                            content: bytes,
+                            identifier_fields: list[str] | None = None) -> dict[str, Any]:
+        """接入来源批次文件：校验、内容摘要与版本判定。
+
+        同一来源 + 同一批次名称下：
+        * 字节完全一致的重传只确认一次，返回原受理批次；
+        * 内容变化生成新版本，旧版本保留但不再参与新的融合取数；
+        * 缺标识字段等校验失败时整批不受理，可按来源单独重新接入。
+        """
+        source = self._find_source_by_code(source_code)
+        if source is None:
+            return {"ok": False, "message": f"数据源 {source_code} 未登记，无法接入批次",
+                    "accepted": False}
+
+        batch_name = str(batch_name or "").strip() or str(file_name or "").strip()
+        file_name = str(file_name or "").strip() or batch_name
+        if not batch_name:
+            return {"ok": False, "message": "批量名称与文件名不能同时为空", "accepted": False}
+
+        digest = sha256_digest(content)
+        previous = self._current_batch(source_code, batch_name)
+        if previous is not None and previous.content_sha256 == digest:
+            previous.upload_attempts += 1
+            previous.duplicate_uploads += 1
+            if previous.accepted:
+                message = (
+                    f"文件字节与{batch_name}当前有效批次 {previous.batch_code} 一致，"
+                    "已按重传处理，不重复受理"
+                )
+            else:
+                message = (
+                    f"文件字节与{batch_name}最近一次批次 {previous.batch_code} 一致，"
+                    f"该批次仍未受理（{'；'.join(previous.errors[:2])}），请修正文件后再上传"
+                )
+            return {
+                "ok": previous.accepted,
+                "accepted": previous.accepted,
+                "message": message,
+                "duplicate": True,
+                "batch": previous.to_record(),
+                "detail": previous.to_detail(),
+            }
+
+        try:
+            parsed = parse_csv_content(content, required_fields=identifier_fields)
+        except Exception as exc:  # FileValidationError 及无法解码的文本
+            parsed = ParsedFile(
+                encoding="unknown", columns=[], rows=[], row_count=0,
+                valid_row_count=0, invalid_row_count=0,
+                errors=[str(exc)], structural_errors=[str(exc)],
+            )
+
+        version = self._next_batch_version(source_code, batch_name)
+        batch_id = self._next_seq()
+        accepted = parsed.accepted
+        status = "已受理" if accepted else "未受理"
+
+        batch = SourceBatch(
+            batch_id=batch_id,
+            batch_code=_generate_code("BATC", batch_id),
+            source_id=source.source_id,
+            source_code=source_code,
+            batch_name=batch_name,
+            version=version,
+            file_name=file_name,
+            content_sha256=digest,
+            byte_size=len(content),
+            encoding=parsed.encoding,
+            columns=parsed.columns,
+            rows=parsed.rows,
+            row_count=parsed.row_count,
+            valid_row_count=parsed.valid_row_count,
+            invalid_row_count=parsed.invalid_row_count,
+            errors=parsed.errors,
+            status=status,
+            accepted=accepted,
+            received_at=_now_iso(),
+        )
+        self._batches[batch_id] = batch
+        if accepted and previous is not None:
+            previous.status = "已被新版本替代"
+
+        message = (
+            f"批次 {batch.batch_code}（{batch_name} v{version}）已受理，"
+            f"有效 {batch.valid_row_count} 行"
+            if accepted
+            else f"批次 {batch.batch_code}（{batch_name} v{version}）未受理：{'；'.join(batch.errors[:3])}"
+        )
+        return {
+            "ok": accepted,
+            "accepted": accepted,
+            "duplicate": False,
+            "message": message,
+            "batch": batch.to_record(),
+            "detail": batch.to_detail(),
+        }
+
+    def list_source_batches(self, source_code: str = "",
+                            batch_name: str = "") -> list[dict[str, Any]]:
+        """按来源或批次名称列出批次版本，供重新接入与核对版本使用。"""
+        rows = [
+            batch for batch in sorted(self._batches.values(), key=lambda b: b.batch_id)
+            if (not source_code or batch.source_code == source_code)
+            and (not batch_name or batch.batch_name == batch_name)
+        ]
+        return [batch.to_record() for batch in rows]
+
+    def get_source_batch(self, batch_id: int) -> SourceBatch | None:
+        return self._batches.get(batch_id)
+
+    def source_by_id(self, source_id: int) -> SourceDef | None:
+        return self._sources.get(source_id)
+
+    def get_effective_batch(self, source_code: str,
+                            batch_name: str = "") -> SourceBatch | None:
+        """返回来源当前（最新版本）的可消费批次，未受理的批次不会返回。"""
+        batches = [
+            batch for batch in self._batches.values()
+            if batch.source_code == source_code and batch.accepted
+            and (not batch_name or batch.batch_name == batch_name)
+        ]
+        if not batches:
+            return None
+        return max(batches, key=lambda b: b.batch_id)
+
+    def _current_batch(self, source_code: str, batch_name: str) -> SourceBatch | None:
+        """取某来源某批次名称的最新版本，含未受理版本（用于重传去重）。"""
+        batches = [
+            batch for batch in self._batches.values()
+            if batch.source_code == source_code and batch.batch_name == batch_name
+        ]
+        if not batches:
+            return None
+        return max(batches, key=lambda b: b.batch_id)
+
+    def _next_batch_version(self, source_code: str, batch_name: str) -> int:
+        key = f"{source_code}::{batch_name}"
+        next_version = self._batch_seq.get(key, 0) + 1
+        self._batch_seq[key] = next_version
+        return next_version
+
+    # ---- 融合作业的批次回执与分批取数 ----
+
+    def start_fusion_run(self, job_id: int) -> dict[str, Any]:
+        """开始一次融合取数：为每个参与来源固定一份批次回执。
+
+        回执固定后，供应方再上传新版本也不会影响本次运行；
+        缺少有效批次的来源被记入 blocked_sources，可单独重新接入后继续作业。
+        """
+        job = self._fusion_jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+
+        prior = self._runs.get(job_id)
+        if prior is not None and (
+            prior.status != "运行中" or any(prior.cursors.values())
+        ):
+            return {
+                "ok": False,
+                "message": (
+                    f"融合作业 {job.job_code} 本次取数已开始（{prior.status}），"
+                    "请继续作业完成取数；重新取整批请新建作业"
+                ),
+                "run_status": prior.status,
+                "receipts": prior.receipt_records(),
+                "blocked_sources": list(prior.blocked_sources),
+            }
+
+        run = FusionRunState(job_id=job_id, status="运行中", created_at=_now_iso())
+        for source_code in job.participant_sources:
+            batch = self.get_effective_batch(source_code)
+            if batch is None:
+                run.blocked_sources.append(source_code)
+                continue
+            receipt = SourceBatchReceipt(
+                receipt_code=_generate_code(f"RECT-{job.job_code}", len(run.receipts) + 1),
+                job_id=job_id,
+                source_code=source_code,
+                batch_id=batch.batch_id,
+                batch_code=batch.batch_code,
+                batch_name=batch.batch_name,
+                batch_version=batch.version,
+                file_name=batch.file_name,
+                content_sha256=batch.content_sha256,
+                valid_row_count=batch.valid_row_count,
+                row_count=batch.row_count,
+                pinned_at=_now_iso(),
+            )
+            run.receipts[source_code] = receipt
+            run.cursors[source_code] = 0
+
+        self._runs[job_id] = run
+        self._run_records[job_id] = {}
+        job.run_status = "融合中"
+        job.run_started_at = run.created_at
+        job.run_completed_at = ""
+
+        return {
+            "ok": not run.blocked_sources,
+            "job_code": job.job_code,
+            "run_status": run.status,
+            "receipts": run.receipt_records(),
+            "blocked_sources": list(run.blocked_sources),
+            "message": (
+                "已为全部来源固定批次回执"
+                if not run.blocked_sources
+                else f"来源未就绪：{'、'.join(run.blocked_sources)}，请单独重新接入后再继续"
+            ),
+        }
+
+    def read_fusion_batch(self, job_id: int, rows_per_source: int | None = None) -> dict[str, Any]:
+        """按回执读取一批有效数据行；读完的文件以游标标记，不会重复计入。"""
+        run = self._runs.get(job_id)
+        if run is None:
+            return {"ok": False, "message": "尚未开始取数，请先固定批次回执"}
+        if run.status == "已完成":
+            return {"ok": False, "message": "本次取数已完成，不会重复消费", "run_status": run.status}
+
+        batch_number = self._run_records.get(job_id, {})
+        consumed: list[dict[str, Any]] = []
+        exhausted: list[str] = []
+        job = self._fusion_jobs.get(job_id)
+        join_key = job.join_key if job is not None else "id"
+
+        for source_code, receipt in run.receipts.items():
+            batch = self._batches.get(receipt.batch_id)
+            if batch is None:
+                continue
+            cursor = run.cursors.get(source_code, 0)
+            if cursor >= len(batch.rows):
+                exhausted.append(source_code)
+                continue
+            limit = len(batch.rows) if rows_per_source is None else max(int(rows_per_source), 0)
+            chunk = batch.rows[cursor:cursor + limit]
+            for offset, raw in enumerate(chunk):
+                row_number = int(raw.get("__row_number__", cursor + offset + 2))
+                record = {key: value for key, value in raw.items() if key != "__row_number__"}
+                return_key = record.get(join_key, "")
+                record.update({
+                    "_source": source_code,
+                    "_fusion_key": f"{source_code}#{return_key}",
+                    "_timestamp": _now_iso(),
+                    "_version": batch.version,
+                    "_batch_code": batch.batch_code,
+                    "_batch_name": batch.batch_name,
+                    "_batch_version": batch.version,
+                    "_file_name": batch.file_name,
+                    "_content_sha256": batch.content_sha256,
+                    "_row_number": row_number,
+                })
+                record_key = f"{source_code}#{row_number}"
+                batch_number[record_key] = record
+                consumed.append(record)
+            run.cursors[source_code] = cursor + len(chunk)
+            receipt.consumed_rows = run.cursors[source_code]
+            if run.cursors[source_code] < len(batch.rows):
+                run.status = "部分取数"
+            else:
+                exhausted.append(source_code)
+
+        self._run_records[job_id] = batch_number
+        all_done = all(run.cursors[src] >= len(self._batches[rec.batch_id].rows)
+                       for src, rec in run.receipts.items() if rec.batch_id in self._batches)
+        if all_done and run.receipts:
+            run.status = "取数完毕"
+
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "run_status": run.status,
+            "consumed_rows": len(consumed),
+            "rows": consumed,
+            "receipts": run.receipt_records(),
+            "blocked_sources": list(run.blocked_sources),
+            "exhausted_sources": exhausted,
+        }
+
+    def continue_fusion_job(self, job_id: int) -> dict[str, Any]:
+        """继续取数并对本次已读明细执行映射、仲裁、门禁与快照。
+
+        每次融合只消费回执所固定批次的一份完整明细（文件名 + 内容摘要一致），
+        输出记录带批次与来源行号，可回溯到来源文件。
+        """
+        job = self._fusion_jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+        run = self._runs.get(job_id)
+        if run is None:
+            started = self.start_fusion_run(job_id)
+            if not started.get("ok") and not started.get("receipts"):
+                return {"ok": False, "message": started.get("message", "无法开始取数")}
+            run = self._runs[job_id]
+
+        for source_code in list(run.blocked_sources):
+            batch = self.get_effective_batch(source_code)
+            if batch is None:
+                continue
+            run.blocked_sources.remove(source_code)
+            receipt = SourceBatchReceipt(
+                receipt_code=_generate_code(f"RECT-{job.job_code}", len(run.receipts) + 1),
+                job_id=job_id,
+                source_code=source_code,
+                batch_id=batch.batch_id,
+                batch_code=batch.batch_code,
+                batch_name=batch.batch_name,
+                batch_version=batch.version,
+                file_name=batch.file_name,
+                content_sha256=batch.content_sha256,
+                valid_row_count=batch.valid_row_count,
+                row_count=batch.row_count,
+                pinned_at=_now_iso(),
+            )
+            run.receipts[source_code] = receipt
+            run.cursors[source_code] = 0
+
+        if run.status == "已完成":
+            return {
+                "ok": True,
+                "already_completed": True,
+                "message": f"融合作业 {job.job_code} 本次取数已完成，不会重复计入已融合的行",
+                "job_code": job.job_code,
+                "run_status": run.status,
+                "raw_records": len(self._run_records.get(job_id, {})),
+                "receipts": run.receipt_records(),
+                "blocked_sources": list(run.blocked_sources),
+            }
+
+        read = self.read_fusion_batch(job_id)
+        if not read.get("ok"):
+            return {"ok": False, "message": read.get("message", "取数失败")}
+        if not read.get("consumed_rows"):
+            if run.blocked_sources:
+                pending = "、".join(run.blocked_sources)
+                message = (
+                    f"融合作业 {job.job_code} 已取明细不再重复计入；"
+                    f"来源 {pending} 仍缺少可受理批次，补齐后继续作业即可"
+                )
+            else:
+                message = f"融合作业 {job.job_code} 没有新的待取明细，不会重复计入已融合的行"
+            return {
+                "ok": True,
+                "already_completed": True,
+                "message": message,
+                "job_code": job.job_code,
+                "run_status": run.status,
+                "raw_records": len(self._run_records.get(job_id, {})),
+                "receipts": run.receipt_records(),
+                "blocked_sources": list(run.blocked_sources),
+            }
+
+        records = list(self._run_records.get(job_id, {}).values())
+        mapped_records = self._apply_schema_mappings(records, job.target_wide_table)
+
+        job.output_rows = len(mapped_records)
+        job.skipped_rows = len(records) - len(mapped_records)
+        job.merged_records = mapped_records
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "job_code": job.job_code,
+            "total_sources": len(job.participant_sources),
+            "raw_records": len(records),
+            "mapped_records": len(mapped_records),
+            "skipped_records": job.skipped_rows,
+            "receipts": run.receipt_records(),
+            "blocked_sources": list(run.blocked_sources),
+            "records": mapped_records,
+        }
+
+        conflict_result = self._apply_conflict_resolution(mapped_records, job.target_wide_table)
+        result["conflict_resolution"] = {
+            key: value for key, value in conflict_result.items() if key != "resolved"
+        }
+        resolved = conflict_result.get("resolved", mapped_records)
+        result["resolved_records"] = resolved
+
+        quality_result = self._apply_quality_gates(resolved, job.target_wide_table)
+        result["quality_gate"] = quality_result
+
+        if quality_result.get("passed", True):
+            snap = self.create_snapshot(
+                job.target_wide_table,
+                partition_key_value=datetime.now(timezone.utc).strftime("%Y%m%d"),
+            )
+            snap.record_count = len(resolved)
+            result["snapshot"] = {
+                "partition_code": snap.partition_code,
+                "record_count": snap.record_count,
+            }
+            for receipt in run.receipts.values():
+                batch = self._batches.get(receipt.batch_id)
+                if batch is not None:
+                    batch.status = "已融合"
+                    batch.fusion_confirmed_at = _now_iso()
+
+        run.status = "已完成" if not run.blocked_sources else "部分完成"
+        run.completed_at = _now_iso()
+        job.run_status = "已完成" if run.status == "已完成" else "部分失败"
+        job.run_completed_at = run.completed_at
+        result["run_status"] = run.status
+        result["confirmation"] = {
+            "batches": [
+                {
+                    "来源编号": receipt.source_code,
+                    "受理批次": receipt.batch_code,
+                    "批次名称": receipt.batch_name,
+                    "数据版本": f"v{receipt.batch_version}",
+                    "来源文件": receipt.file_name,
+                    "内容摘要": receipt.content_sha256,
+                    "有效行数": receipt.valid_row_count,
+                    "已取行数": receipt.consumed_rows,
+                }
+                for receipt in run.receipts.values()
+            ],
+            "blocked_sources": list(run.blocked_sources),
+        }
+        return result
+
+    def get_fusion_run(self, job_id: int) -> dict[str, Any]:
+        """查询作业当前取数状态、批次回执与逐行来源信息。"""
+        run = self._runs.get(job_id)
+        if run is None:
+            return {"ok": True, "job_id": job_id, "run_status": "未开始",
+                    "receipts": [], "blocked_sources": []}
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "run_status": run.status,
+            "created_at": run.created_at,
+            "completed_at": run.completed_at,
+            "receipts": run.receipt_records(),
+            "blocked_sources": list(run.blocked_sources),
+            "records": [
+                {
+                    "来源编号": record.get("_source"),
+                    "受理批次": record.get("_batch_code"),
+                    "来源文件": record.get("_file_name"),
+                    "原数据行": str(record.get("_row_number", "")),
+                    "内容摘要": record.get("_content_sha256"),
+                    "数据": {k: v for k, v in record.items() if not k.startswith("_")},
+                }
+                for record in self._run_records.get(job_id, {}).values()
+            ],
+        }
+
     # ---- 复合融合操作 ----
 
     def execute_fusion_pipeline(self, job_id: int) -> dict[str, Any]:
         """执行完整融合流水线：数据源读取 -> 映射转换 -> 冲突仲裁 -> 质量检查 -> 产出快照。
 
+        这是没有批次文件时的演示路径（按数据源模拟三条样例记录）。
+        已登记来源的真实文件请走 import_source_batch + start_fusion_run + continue_fusion_job。
         返回值包含融合记录、冲突日志、质量报告和快照信息。
         """
         job = self._fusion_jobs.get(job_id)
@@ -874,6 +1336,7 @@ class FusionEngine:
             "cross_validates": len(self._cross_validates),
             "drifts": len(self._drifts),
             "monitors": len(self._monitors),
+            "source_batches": len(self._batches),
         }
 
 

@@ -73,6 +73,37 @@ npm run dev
 | 变更审计 | `audit_trail` | 审计记录 | 记录编号、变更目标、操作人 |
 | 目录检索 | `catalog_search` | 数据目录 | 目录编号、宽表名称、标签列表 |
 
+## 来源批次文件接入
+
+数据源定义里的登记只是接入声明，真正参与融合的是**来源批次文件**。批次接入页
+（`/batch_ingest`）为已登记来源上传 CSV，融合作业只从“来源批次回执”读取有效数据行。
+
+- 上传校验：必须含标识字段（默认 `id`），标识为空/重复、`amount` 非数值、列数超出表头
+  都会让**整份文件**不予受理，不会出现半份明细被融合消费。
+- 重传去重：同一来源 + 同一批次名称下字节完全一致时只确认一次有效批次，
+  页面显示重传次数；内容变化则生成新版本（v2、v3…），旧版本标记为“已被新版本替代”。
+- 批次回执：作业开始取数时按来源固定一个已受理批次。此后供应方再上传新版本，
+  本次作业仍读完原版本的完整明细，回执的“已取行数”等于该批有效行数。
+- 输出追溯：`GET /api/fusion/jobs/{id}/run` 与继续作业的返回里，每条记录都带
+  `_batch_code`、`_file_name`、`_content_sha256`、`_row_number`，可追到来源文件与原数据行。
+- 缺字段来源：未受理的来源进入 `blocked_sources`，只需对该来源重新上传合格文件，
+  再次继续作业即补齐；先前已融合的行不会重复计入。
+- 已完成的取数再次继续会返回 `already_completed`，不会重复消费。
+
+接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/fusion/sources/{source_id}/batches?batch_name=&file_name=` | 上传原始字节（`text/csv`） |
+| GET | `/api/fusion/sources/{source_id}/batches` | 列出来源的批次版本 |
+| GET | `/api/fusion/batches/{batch_id}` | 查看校验错误与完整可消费行 |
+| POST | `/api/fusion/jobs/{job_id}/start` | 固定批次回执 |
+| POST | `/api/fusion/jobs/{job_id}/read?rows_per_source=` | 先读取一部分明细 |
+| POST | `/api/fusion/jobs/{job_id}/continue` | 继续取数并完成融合 |
+| GET | `/api/fusion/jobs/{job_id}/run` | 取数状态、回执与逐行来源 |
+
+上传使用原始请求体而不是 multipart，因此不需要额外的 `python-multipart` 依赖。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
